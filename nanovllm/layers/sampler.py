@@ -4,7 +4,11 @@ from torch import nn
 
 class Sampler(nn.Module):
 
-    @torch.compile
+    def __init__(self):
+        super().__init__()
+        if torch.cuda.is_available():
+            self.forward = torch.compile(self.forward)
+
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))
         probs = torch.softmax(logits, dim=-1)

@@ -1,5 +1,25 @@
+import types
 import torch
 from torch import nn
+
+
+def _rms_forward(self, x: torch.Tensor) -> torch.Tensor:
+    orig_dtype = x.dtype
+    x = x.float()
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    x.mul_(torch.rsqrt(var + self.eps))
+    x = x.to(orig_dtype).mul_(self.weight)
+    return x
+
+
+def _add_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    orig_dtype = x.dtype
+    x = x.float().add_(residual.float())
+    residual = x.to(orig_dtype)
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    x.mul_(torch.rsqrt(var + self.eps))
+    x = x.to(orig_dtype).mul_(self.weight)
+    return x, residual
 
 
 class RMSNorm(nn.Module):
@@ -12,32 +32,11 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
-
-    @torch.compile
-    def rms_forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x
-
-    @torch.compile
-    def add_rms_forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_dtype = x.dtype
-        x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x, residual
+        self.rms_forward = types.MethodType(_rms_forward, self)
+        self.add_rms_forward = types.MethodType(_add_rms_forward, self)
+        if torch.cuda.is_available():
+            self.rms_forward = torch.compile(self.rms_forward)
+            self.add_rms_forward = torch.compile(self.add_rms_forward)
 
     def forward(
         self,
