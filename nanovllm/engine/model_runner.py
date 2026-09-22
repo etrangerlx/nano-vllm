@@ -1,6 +1,5 @@
 import pickle
 import torch
-import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -18,8 +17,6 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.world_size = config.tensor_parallel_size
-        self.rank = rank
         self.event = event
 
         self.device = "cpu"
@@ -36,41 +33,12 @@ class ModelRunner:
 
 
     def exit(self):
-        if self.world_size > 1:
-            self.shm.close()
-            dist.barrier()
-            if self.rank == 0:
-                self.shm.unlink()
-        if self.world_size > 1:
-            dist.destroy_process_group()
+        pass
 
     def loop(self):
-        while True:
-            method_name, args = self.read_shm()
-            self.call(method_name, *args)
-            if method_name == "exit":
-                break
-
-    def read_shm(self):
-        assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
-        return method_name, args
-
-    def write_shm(self, method_name, *args):
-        assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
-        n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
-        for event in self.event:
-            event.set()
+        pass
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
 
@@ -78,7 +46,7 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         
@@ -175,10 +143,14 @@ class ModelRunner:
         return self.model.compute_logits(self.model(input_ids, positions))
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+            
+        temperatures = self.prepare_sample(seqs)
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, temperatures).tolist()
         reset_context()
         return token_ids
 
