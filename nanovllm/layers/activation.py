@@ -7,8 +7,6 @@ class SiluAndMul(nn.Module):
 
     def __init__(self):
         super().__init__()
-        if torch.cuda.is_available():
-            self.forward = torch.compile(self.forward)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, y = x.chunk(2, -1)

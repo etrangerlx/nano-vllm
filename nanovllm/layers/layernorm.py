@@ -34,9 +34,6 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.rms_forward = types.MethodType(_rms_forward, self)
         self.add_rms_forward = types.MethodType(_add_rms_forward, self)
-        if torch.cuda.is_available():
-            self.rms_forward = torch.compile(self.rms_forward)
-            self.add_rms_forward = torch.compile(self.add_rms_forward)
 
     def forward(
         self,
