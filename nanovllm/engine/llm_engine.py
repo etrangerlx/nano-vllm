@@ -41,11 +41,9 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        return token_ids, is_prefill
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -60,12 +58,13 @@ class LLMEngine:
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
-        outputs = {} 
+        outputs = {i: [] for i in range(len(prompts))} 
         while not self.is_finished(): 
-            output, num_tokens = self.step()
-
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            output, is_prefill = self.step()
+            for id,token_id in enumerate(output):
+                outputs[id].append(token_id)
+                if id == 0:
+                    print(self.tokenizer.decode(token_id), end="", flush=True)
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
