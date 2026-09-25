@@ -1,7 +1,7 @@
 from transformers import AutoProcessor, AutoModelForMultimodalLM
 
-processor = AutoProcessor.from_pretrained("/mnt/g/Models/Qwen3.5-0.8B")
-model = AutoModelForMultimodalLM.from_pretrained("/mnt/g/Models/Qwen3.5-0.8B", device_map="auto")
+processor = AutoProcessor.from_pretrained("/workspace/models/Qwen3.5-0.8B")
+model = AutoModelForMultimodalLM.from_pretrained("/workspace/models/Qwen3.5-0.8B", device_map="auto")
 
 # The vision encoder supports at most 2304 patches (vision_config.num_position_embeddings),
 # i.e. 2304 * 16 * 16 = 589,824 px (~768x768). The default config leaves longest_edge at
@@ -11,7 +11,7 @@ messages = [
     {
         "role": "user",
         "content": [
-            {"type": "image", "url": "/home/leixian/nano-vllm/image.png"},
+            {"type": "image", "url": "/workspace/project/nano-vllm/resource/images/cat.jpg"},
             {"type": "text", "text": "描述一下这个图片?"}
         ]
     },

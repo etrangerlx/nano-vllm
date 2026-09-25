@@ -4,12 +4,13 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("E:/models/Qwen3-0.6B")
+    path = os.path.expanduser("/workspace/models/Qwen3-0.6B")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, tensor_parallel_size=1)
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
+        "介绍一下自己",
         "introduce yourself",
         "list all prime numbers within 100",
     ]
