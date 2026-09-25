@@ -21,7 +21,7 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)

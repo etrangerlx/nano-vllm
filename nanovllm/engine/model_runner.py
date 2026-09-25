@@ -22,7 +22,7 @@ def build_model(hf_config):
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
