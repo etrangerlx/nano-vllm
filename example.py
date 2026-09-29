@@ -4,7 +4,7 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/workspace/models/Qwen3-0.6B")
+    path = os.path.expanduser("E:/models/Qwen3-0.8B")
     # path = os.path.expanduser("/workspace/models/Qwen2-0.5B-Instruct")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path)

@@ -18,4 +18,6 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        # Multi-modal wrappers carry the decoder settings in `text_config`.
+        text_cfg = getattr(self.hf_config, "text_config", self.hf_config)
+        self.max_model_len = min(self.max_model_len, getattr(text_cfg, "max_position_embeddings", self.max_model_len))

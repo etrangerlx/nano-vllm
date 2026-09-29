@@ -33,17 +33,18 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> int:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        return token_ids, is_prefill
+        return seqs, token_ids, is_prefill
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -56,16 +57,19 @@ class LLMEngine:
     ) -> list[str]:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+        seq_id_to_prompt: dict[int, int] = {}
+        for idx, (prompt, sp) in enumerate(zip(prompts, sampling_params)):
+            seq_id = self.add_request(prompt, sp)
+            seq_id_to_prompt[seq_id] = idx
         outputs = {i: [] for i in range(len(prompts))} 
         while not self.is_finished(): 
-            output, is_prefill = self.step()
-            for id,token_id in enumerate(output):
-                outputs[id].append(token_id)
-                if id == 0:
+            seqs, output, is_prefill = self.step()
+            for seq, token_id in zip(seqs, output):
+                prompt_idx = seq_id_to_prompt[seq.seq_id]
+                outputs[prompt_idx].append(token_id)
+                if prompt_idx == 0:
                     print(self.tokenizer.decode(token_id), end="", flush=True)
 
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        outputs = [outputs[i] for i in range(len(prompts))]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs
