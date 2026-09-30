@@ -205,6 +205,9 @@ class GatedDeltaNet(nn.Module):
         # allocated by ModelRunner
         self.recurrent_state = torch.tensor([])
         self.conv_state = torch.tensor([])
+        # per-draft-position state snapshots for speculative verification
+        self.verify_snap_rec = torch.tensor([])
+        self.verify_snap_conv = torch.tensor([])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_context()
@@ -223,39 +226,79 @@ class GatedDeltaNet(nn.Module):
         if context.is_prefill:
             starts = context.cu_seqlens_q[:-1]
             ends = context.cu_seqlens_q[1:]
-            for i in range(len(starts)):
-                s, e = starts[i].item(), ends[i].item()
-                slot = slots[s].item() if slots is not None else 0
-                raw_i = raw[s:e]  # [L, conv_dim]
-                L = e - s
-                convi = F.conv1d(raw_i.transpose(0, 1)[None], self.conv1d.weight,
-                                 padding=state_len, groups=self.conv1d.groups)[0, :, :L]
-                mixed = F.silu(convi).transpose(0, 1)  # [L, conv_dim]
-                if has_state:
-                    tail = raw_i.transpose(0, 1).contiguous()          # [conv_dim, L]
-                    tail = F.pad(tail, (max(0, state_len - L), 0))     # left-zero pad to state_len
-                    self.conv_state[slot].copy_(tail[:, -state_len:].contiguous())
-                query_i, key_i, value_i = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-                g_i = g[s:e]
-                b_i = b[s:e]
-                q_i = l2norm(query_i.reshape(-1, self.num_v_heads, self.head_k_dim), eps=1e-6)
-                k_i = l2norm(key_i.reshape(-1, self.num_k_heads, self.head_k_dim), eps=1e-6)
-                if self.num_v_heads // self.num_k_heads > 1:
-                    k_i = k_i.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
-                v_i = value_i.reshape(-1, self.num_v_heads, self.head_v_dim)
-                init = self.recurrent_state[slot].unsqueeze(0) if has_state else None
-                out_1, state = _torch_chunk_gated_delta_rule(
-                    q_i.transpose(0, 1).unsqueeze(0).float(),
-                    k_i.transpose(0, 1).unsqueeze(0).float(),
-                    v_i.transpose(0, 1).unsqueeze(0).float(),
-                    g_i.T.unsqueeze(0).float(),
-                    b_i.T.unsqueeze(0).float(),
-                    init,
-                )
-                if has_state:
-                    self.recurrent_state[slot].copy_(state[0])
-                # out_1: [1, L, H, vdim] -> token-major [L, H, vdim]
-                outputs.append(out_1.squeeze(0).to(hidden_states.dtype).contiguous())
+            if context.is_verify:
+                # Speculative verify: each segment holds the K draft tokens. Step
+                # through them one token at a time and snapshot the state after
+                # each, so the runner can roll back to any accepted prefix.
+                for i in range(len(starts)):
+                    s, e = starts[i].item(), ends[i].item()
+                    slot = slots[s].item() if slots is not None else 0
+                    conv_run = self.conv_state[slot]                  # [conv_dim, state_len]
+                    rec = self.recurrent_state[slot].unsqueeze(0)     # [1, H, kdim, vdim]
+                    for t in range(s, e):
+                        conv_in = torch.cat([conv_run, raw[t:t + 1].transpose(0, 1)], dim=1)
+                        convi = F.conv1d(conv_in[None], self.conv1d.weight,
+                                         groups=self.conv1d.groups)[0, :, -1]  # [conv_dim]
+                        conv_run = conv_in[:, -state_len:].contiguous()
+                        mixed = F.silu(convi).view(1, -1)             # [1, conv_dim]
+                        query_t, key_t, value_t = torch.split(
+                            mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+                        q_t = l2norm(query_t.reshape(1, self.num_v_heads, self.head_k_dim), eps=1e-6)
+                        k_t = l2norm(key_t.reshape(1, self.num_k_heads, self.head_k_dim), eps=1e-6)
+                        if self.num_v_heads // self.num_k_heads > 1:
+                            k_t = k_t.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+                        v_t = value_t.reshape(1, self.num_v_heads, self.head_v_dim)
+                        out_t, rec = _torch_recurrent_gated_delta_rule(
+                            q_t.unsqueeze(2).float(), k_t.unsqueeze(2).float(), v_t.unsqueeze(2).float(),
+                            g[t].view(1, -1, 1).float(), b[t].view(1, -1, 1).float(), rec)
+                        self.verify_snap_rec[t - s, slot].copy_(rec[0])
+                        self.verify_snap_conv[t - s, slot].copy_(conv_run)
+                        outputs.append(out_t.squeeze(2).squeeze(0).to(hidden_states.dtype))
+                    if has_state:
+                        self.recurrent_state[slot].copy_(rec[0])
+                        self.conv_state[slot].copy_(conv_run)
+            else:
+                for i in range(len(starts)):
+                    s, e = starts[i].item(), ends[i].item()
+                    slot = slots[s].item() if slots is not None else 0
+                    raw_i = raw[s:e]  # [L, conv_dim]
+                    L = e - s
+                    if has_state:
+                        # continue from stored conv state: prepend it so the conv
+                        # window sees the previous state_len inputs (zero state on
+                        # first chunk is equivalent to zero padding)
+                        conv_in = torch.cat([self.conv_state[slot], raw_i.transpose(0, 1)], dim=1)  # [conv_dim, state_len + L]
+                        convi = F.conv1d(conv_in[None], self.conv1d.weight,
+                                         groups=self.conv1d.groups)[0]  # [conv_dim, L]
+                        self.conv_state[slot].copy_(conv_in[:, -state_len:].contiguous())
+                    else:
+                        convi = F.conv1d(raw_i.transpose(0, 1)[None], self.conv1d.weight,
+                                         padding=state_len, groups=self.conv1d.groups)[0, :, :L]
+                        tail = raw_i.transpose(0, 1).contiguous()          # [conv_dim, L]
+                        tail = F.pad(tail, (max(0, state_len - L), 0))     # left-zero pad to state_len
+                        self.conv_state[slot].copy_(tail[:, -state_len:].contiguous())
+                    mixed = F.silu(convi).transpose(0, 1)  # [L, conv_dim]
+                    query_i, key_i, value_i = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+                    g_i = g[s:e]
+                    b_i = b[s:e]
+                    q_i = l2norm(query_i.reshape(-1, self.num_v_heads, self.head_k_dim), eps=1e-6)
+                    k_i = l2norm(key_i.reshape(-1, self.num_k_heads, self.head_k_dim), eps=1e-6)
+                    if self.num_v_heads // self.num_k_heads > 1:
+                        k_i = k_i.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+                    v_i = value_i.reshape(-1, self.num_v_heads, self.head_v_dim)
+                    init = self.recurrent_state[slot].unsqueeze(0) if has_state else None
+                    out_1, state = _torch_chunk_gated_delta_rule(
+                        q_i.transpose(0, 1).unsqueeze(0).float(),
+                        k_i.transpose(0, 1).unsqueeze(0).float(),
+                        v_i.transpose(0, 1).unsqueeze(0).float(),
+                        g_i.T.unsqueeze(0).float(),
+                        b_i.T.unsqueeze(0).float(),
+                        init,
+                    )
+                    if has_state:
+                        self.recurrent_state[slot].copy_(state[0])
+                    # out_1: [1, L, H, vdim] -> token-major [L, H, vdim]
+                    outputs.append(out_1.squeeze(0).to(hidden_states.dtype).contiguous())
             core_attn_out = torch.cat(outputs, dim=0).reshape(-1, self.head_v_dim)
         else:
             cur = raw.unsqueeze(2)  # [B, conv_dim, 1]
@@ -345,9 +388,9 @@ class Qwen3_5MLP(nn.Module):
 
 
 class Qwen3_5DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int, layer_type: str | None = None):
         super().__init__()
-        self.block_type = config.layer_types[layer_idx]
+        self.block_type = layer_type or config.layer_types[layer_idx]
         if self.block_type == "linear_attention":
             self.linear_attn = GatedDeltaNet(config, layer_idx)
         elif self.block_type == "full_attention":
@@ -388,6 +431,34 @@ class Qwen3_5Model(nn.Module):
         return self.norm(hidden_states)
 
 
+class Qwen3_5MTP(nn.Module):
+    """EAGLE-style multi-token-prediction drafter (shares embedding / lm_head with the target).
+
+    At sequence position i the drafter consumes the pair (token t_i, target hidden h_{i-1})
+    — exactly the MTP training convention — and its logits at position i predict t_{i+1}.
+    """
+
+    def __init__(self, config: Qwen3_5TextConfig, embed_tokens: VocabParallelEmbedding):
+        super().__init__()
+        self.embed_tokens = embed_tokens    # shared with the target model
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            Qwen3_5DecoderLayer(config, i, layer_type="full_attention")
+            for i in range(getattr(config, "mtp_num_hidden_layers", 0))
+        )
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, target_hidden: torch.Tensor) -> torch.Tensor:
+        inputs_embeds = self.pre_fc_norm_embedding(self.embed_tokens(input_ids))
+        target_hidden = self.pre_fc_norm_hidden(target_hidden)
+        hidden_states = self.fc(torch.cat([inputs_embeds, target_hidden], dim=-1))
+        for layer in self.layers:
+            hidden_states = layer(positions, hidden_states)
+        return self.norm(hidden_states)
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     weight_prefix = "model.language_model."
 
@@ -402,6 +473,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.lm_head.weight.data = self.embed_tokens.weight.data
         else:
             raise ValueError("Qwen3.5-0.8B requires tied word embeddings")
+        if getattr(config, "mtp_num_hidden_layers", 0):
+            self.mtp = Qwen3_5MTP(config, self.embed_tokens)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)

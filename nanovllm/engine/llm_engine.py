@@ -42,9 +42,12 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        return seqs, token_ids, is_prefill
+        outputs = self.model_runner.call("run", seqs, is_prefill)
+        self.scheduler.postprocess(seqs, outputs, is_prefill)
+        for seq in seqs:
+            if seq.is_finished:
+                self.model_runner.release_seq(seq.seq_id)
+        return seqs, outputs, is_prefill
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -62,13 +65,14 @@ class LLMEngine:
             seq_id = self.add_request(prompt, sp)
             seq_id_to_prompt[seq_id] = idx
         outputs = {i: [] for i in range(len(prompts))} 
-        while not self.is_finished(): 
+        while not self.is_finished():
             seqs, output, is_prefill = self.step()
-            for seq, token_id in zip(seqs, output):
+            for seq, toks in zip(seqs, output):
                 prompt_idx = seq_id_to_prompt[seq.seq_id]
-                outputs[prompt_idx].append(token_id)
+                outputs[prompt_idx].extend(toks)
                 if prompt_idx == 0:
-                    print(self.tokenizer.decode(token_id), end="", flush=True)
+                    for token_id in toks:
+                        print(self.tokenizer.decode(token_id), end="", flush=True)
 
         outputs = [outputs[i] for i in range(len(prompts))]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]

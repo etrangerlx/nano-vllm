@@ -100,12 +100,28 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    def _spec_extra_blocks(self, seq: Sequence, num_ahead: int) -> int:
+        """Blocks speculative decoding fills beyond the current committed tokens.
 
-    def may_append(self, seq: Sequence):
+        Verification writes KV up to position len(seq)+num_ahead-1 and a fully
+        accepted step commits a bonus token at position len(seq)+num_ahead.
+        """
+        last = len(seq) + num_ahead                        # farthest KV/commit position
+        covered = len(seq.block_table) * self.block_size   # first position without a block
+        return max(0, (last - covered) // self.block_size + 1)
+
+    def can_append(self, seq: Sequence, num_ahead: int = 0) -> bool:
+        need = int(len(seq) % self.block_size == 1)
+        if num_ahead:
+            need += self._spec_extra_blocks(seq, num_ahead)
+        return len(self.free_block_ids) >= need
+
+    def may_append(self, seq: Sequence, num_ahead: int = 0):
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
+        if num_ahead:
+            for _ in range(self._spec_extra_blocks(seq, num_ahead)):
+                seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
