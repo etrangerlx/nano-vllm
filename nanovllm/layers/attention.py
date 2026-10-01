@@ -35,22 +35,44 @@ class Attention(nn.Module):
 
     @staticmethod
     def _scatter_to_padded(x, lengths, max_len):
+        """把紧凑排列的 x 展开成带 padding 的批次张量。
+
+        输入: x 形状 [sum(lengths), *rest_dims] —— 所有序列按顺序拼接
+        输出: out 形状 [B, max_len, *rest_dims] —— 每个序列独立一行，不足补零
+
+        示例: lengths=[3,2], x=[A,B,C,X,Y]
+              → out[0]=[A,B,C,0], out[1]=[X,Y,0,0]
+        """
         batch_size = lengths.shape[0]
-        batch_idx = torch.arange(batch_size, device=x.device).unsqueeze(1).expand(-1, max_len)
-        seq_idx = torch.arange(max_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        valid = seq_idx < lengths.unsqueeze(1)
+        # 先创建一个全零的填充张量
         out = x.new_zeros(batch_size, max_len, *x.shape[1:])
-        out[batch_idx[valid], seq_idx[valid]] = x
+        # 用切片方式，逐序列拷贝数据，直观易懂
+        offset = 0
+        for i in range(batch_size):
+            seq_len = lengths[i].item()
+            # 从紧凑 x 中取出第 i 条序列，长度为 seq_len
+            seq_data = x[offset : offset + seq_len]
+            # 写入填充张量第 i 行的前 seq_len 个位置
+            out[i, :seq_len] = seq_data
+            offset += seq_len
         return out
 
     @staticmethod
     def _gather_from_padded(x_padded, lengths):
-        batch_size = lengths.shape[0]
-        max_len = x_padded.shape[1]
-        batch_idx = torch.arange(batch_size, device=x_padded.device).unsqueeze(1).expand(-1, max_len)
-        seq_idx = torch.arange(max_len, device=x_padded.device).unsqueeze(0).expand(batch_size, -1)
-        valid = seq_idx < lengths.unsqueeze(1)
-        return x_padded[batch_idx[valid], seq_idx[valid]]
+        """把带 padding 的批次张量中的有效 token 收集起来，紧凑拼接。
+
+        输入: x_padded 形状 [B, max_len, *rest_dims]
+        输出: 形状 [sum(lengths), *rest_dims] —— 按 batch 顺序依次拼接有效部分
+
+        示例: lengths=[3,2], x_padded=[[A,B,C,0],[X,Y,0,0]]
+              → [A,B,C,X,Y]
+        """
+        # 收集每一条序列的有效部分（去掉 padding），然后按顺序拼接
+        pieces = []
+        for i, seq_len in enumerate(lengths.tolist()):
+            # 取第 i 条序列的前 seq_len 个真实 token（丢掉后面的 padding）
+            pieces.append(x_padded[i, :seq_len])
+        return torch.cat(pieces, dim=0)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
